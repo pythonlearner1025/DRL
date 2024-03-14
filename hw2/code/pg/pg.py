@@ -10,9 +10,10 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import time
 
 class PolicyGradient(nn.Module):
-    def __init__(self, state_size, action_size, lr_actor=1e-3, lr_critic=1e-3, mode='REINFORCE', n=128, gamma=0.99, device='cpu'):
+    def __init__(self, state_size, action_size, lr_actor=1e-3, lr_critic=1e-3, mode='REINFORCE', n=128, gamma=0.99, device='cuda'):
         super(PolicyGradient, self).__init__()
 
         self.state_size = state_size
@@ -31,7 +32,6 @@ class PolicyGradient(nn.Module):
             nn.Linear(state_size, hidden_layer_size),
             nn.ReLU(),
             nn.Linear(hidden_layer_size, action_size),
-            nn.Sigmoid(),
             nn.Softmax()
         )
 
@@ -54,11 +54,12 @@ class PolicyGradient(nn.Module):
         return(self.actor(state), self.critic(state))
 
     @torch.inference_mode
-    def get_action(self, state, stochastic):
+    def get_action(self, state, stochastic, cuda=1):
         # if stochastic, sample using the action probabilities, else get the argmax
         # BEGIN STUDENT SOLUTION
         # END STUDENT SOLUTION
-        probs = self.actor(torch.tensor(state)).detach().numpy()
+        state = torch.tensor(state).to(self.device) if cuda else torch.tensor(state)
+        probs = self.actor(state).detach().cpu().numpy()
         if stochastic:
             act = np.random.choice(a=len(probs), p=probs)
         else:
@@ -84,11 +85,15 @@ class PolicyGradient(nn.Module):
         for i,rwd in enumerate(rwds):
             sum += self.gamma**i*rwd
         return sum 
-    
-    def run(self, env, max_steps, num_episodes):
-        def te(x): return torch.tensor(x)
+
+    # N-step A2C 
+    def run(self, env, max_steps, num_episodes, cuda=1):
+        self.critic = self.critic.to(self.device) if cuda else self.critic
+        self.actor = self.actor.to(self.device) if cuda else self.actor
+        def te(x, cuda=cuda): return torch.tensor(x) if not cuda else torch.tensor(x).to(self.device)
         total_rewards = []
         N,gamma = self.n, self.gamma
+        st = time.time()
         for ep in range(num_episodes):
             steps = 0
             s, _ = env.reset()
@@ -101,31 +106,41 @@ class PolicyGradient(nn.Module):
                 if done: break
                 steps+=1
             T = len(buffer)
-            #slice = buffer[0:N if N <= T else T]
-            rs = [s[2] for s in buffer]
-            Gs = [] 
+            # super messy calculate rewards backwards
+            Gs = [0] 
             Gts = []
             Vts = []
             Ps = []
-            for t in range(T):
-                v_end = self.critic(te(buffer[t+N][0])) if t+N<T else te([0])
-                if t == 0:
-                    G = self.calc_gt([s[2] for s in buffer[0:N if N <= T else T]])
-                    Gt = te(G) + te(gamma**N)*v_end
-                else:
-                    G = Gs[-1] + gamma**(N-1)*rs[t] if t+N-1<T else Gs[-1] + gamma*(T-t-1)*rs[t]
-                    Gt = te(G) + te(gamma**N)*v_end
-                a_t = buffer[t][1]
-                Vt = self.critic(te(buffer[t][0]))
+            Ps_idxs = []
+            v_ends = []
+            for t in range(T-1, -1, -1):
+                if t+N<T:
+                    v_ends.append(te(buffer[t][0]))
+                # t=T-1, then R
+                G = buffer[t][2] + gamma*Gs[-1]
+                Gt = te(G) #+ te(gamma**N)*v_end
+                Vt = te(buffer[t][0])
                 Gs.append(G)
                 Gts.append(Gt)
                 Vts.append(Vt)
-                Ps.append(self.actor(te(buffer[t][0]))[a_t])
+                Ps.append(te(buffer[t][0]))
+                Ps_idxs.append(buffer[t][1])
             assert len(Gts) ==  T
-            # TODO is compute graph tracked?
-            Gts = torch.stack(Gts).view(-1, 1)
-            Vts = torch.stack(Vts).view(-1, 1)
-            Ps = torch.log(torch.stack(Ps))
+            # run all nets in batch 
+            v_ends = self.critic(torch.stack(v_ends)) if v_ends else []
+            Gts = torch.stack(Gts).view(-1, 1) 
+            # inefficient add v_ends but oh well
+            for t in range(len(Gts)):
+                if t+N<T:
+                    Gts[t] += v_ends[t] 
+                else:
+                    break
+            Vts = self.critic(torch.stack(Vts))
+            Ps = torch.log(self.actor(torch.stack(Ps)))
+            Ps_idxs = torch.tensor(Ps_idxs).to(Ps.device)
+            Ps_idxs = Ps_idxs.unsqueeze(-1)
+            Ps = torch.gather(Ps, 1, Ps_idxs).squeeze(-1)
+            
             L_act = ((Gts.detach()-Vts.detach())*Ps).sum() / -T
             L_crit = ((Gts-Vts)**2).sum() / T
 
@@ -136,12 +151,14 @@ class PolicyGradient(nn.Module):
             self.optimizer_actor.zero_grad()  # Clear existing gradients
             L_act.backward()  # Backpropagate the actor loss
             self.optimizer_actor.step()  # Update actor network weights
-
             if ep % 100 == 0:
+                e = time.time()
                 print(f'-- episode {ep} --')
+                print(f'{e-st:7.2f}')
+                st = time.time()
                 # 20 IID test eps
                 mean_rwds = []
-                for i in range(20):
+                for _ in range(20):
                     test_steps = 0
                     s,_ = env.reset()
                     test_rwds = []
@@ -158,11 +175,7 @@ class PolicyGradient(nn.Module):
                 total_rewards.append(mean_rwd)
                 print(f'mean rwd per 20 trials: {mean_rwd}')
                     
-        # run the agent through the environment num_episodes times for at most max steps
-        # BEGIN STUDENT SOLUTION
-        # END STUDENT SOLUTION
         print(len(total_rewards))
-       # assert len(total_rewards) == num_episodes // 100
         return(total_rewards)
 
 
@@ -185,7 +198,6 @@ def graph_agents(graph_name, agents, env, max_steps, num_episodes):
     fig.savefig(f'./graphs/{graph_name}.png')
     plt.close(fig)
     print(f'Finished: {graph_name}')
-
 
 
 def parse_args():
@@ -212,6 +224,7 @@ def main():
     for i in range(args.num_runs):
         print(f'--- run {i} ---')
         PG = PolicyGradient(state_sz, action_sz, lr_actor=1e-3, lr_critic=1e-3, n=args.n, gamma=0.99, device='cpu')
+        PG.device = 'cpu'
         rwds = PG.run(env, args.max_steps, args.num_episodes)
         avg_ep_rwds.append(rwds)
     e = time.time()
